@@ -44,9 +44,9 @@ Optimizing compilers skip the frame pointer setup to free RBP as a general-purpo
 #### 3. Push-Only Prologue (`push-only`)
 
 ```asm
-push rbp        ; Save frame pointer only
+push rbx        ; Save callee-saved register
 ```
-`push rbp` saves the caller's frame pointer but the function never executes `mov rbp, rsp`, so no frame chain is established. This may appear in leaf functions or as part of callee-saved register preservation where RBP is used as a general-purpose register.
+A push of any callee-saved register (rbx, rbp, r12–r15) at a function boundary without a subsequent `mov rbp, rsp`. When the compiler omits the frame pointer (`-fomit-frame-pointer`, the default at `-O2`), the first instruction of a function is often a push of whichever callee-saved register it needs, such as `push rbx` or `push r12`. No frame chain is established.
 
 #### 4. LEA-Based Stack Allocation (`lea-based`)
 
@@ -129,7 +129,7 @@ func main() {
 [classic] 0x401000: push rbp; mov rbp, rsp
 [classic] 0x401020: push rbp; mov rbp, rsp
 [no-frame-pointer] 0x401040: sub rsp, 0x20
-[push-only] 0x401060: push rbp
+[push-only] 0x401060: push rbx
 ```
 
 ## API Reference
@@ -224,7 +224,6 @@ type Prologue struct {
 - **No Symbol Information**: Works on stripped binaries but reports addresses only
 - **Heuristic-Based**: May have false positives in data sections or inline data
 - **Linear Disassembly**: Doesn't handle indirect jumps or computed addresses
-- **No CET Support**: ENDBR64 detection not yet implemented
 
 ## Dependencies
 
