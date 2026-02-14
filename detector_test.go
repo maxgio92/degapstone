@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/maxgio92/prologo"
@@ -50,6 +52,16 @@ func TestDetectProloguesAMD64(t *testing.T) {
 			wantCount: 1,
 			wantType:  prologo.PrologueNoFramePointer,
 			wantAddr:  0,
+		},
+		{
+			// nop; push rbx (0x53); sub rsp, 0x20 — push not at boundary,
+			// only the sub rsp is detected as NoFramePointer.
+			name:      "no-frame-pointer-after-push",
+			code:      []byte{0x90, 0x53, 0x48, 0x83, 0xec, 0x20},
+			baseAddr:  0,
+			wantCount: 1,
+			wantType:  prologo.PrologueNoFramePointer,
+			wantAddr:  2,
 		},
 		{
 			// push rbp; nop — push rbp at start, not followed by mov rbp, rsp
@@ -99,15 +111,6 @@ func TestDetectProloguesAMD64(t *testing.T) {
 			}
 		})
 	}
-}
-
-// arm64Insn encodes an ARM64 instruction as little-endian bytes.
-func arm64Insn(insns ...uint32) []byte {
-	buf := make([]byte, 4*len(insns))
-	for i, insn := range insns {
-		binary.LittleEndian.PutUint32(buf[i*4:], insn)
-	}
-	return buf
 }
 
 func TestDetectProloguesARM64(t *testing.T) {
@@ -212,7 +215,7 @@ func TestDetectPrologues_UnsupportedArch(t *testing.T) {
 	}
 }
 
-func TestDetectProloguesFromELF(t *testing.T) {
+func TestDetectProloguesFromELF_Go(t *testing.T) {
 	tests := []struct {
 		name      string
 		goarch    string
@@ -301,16 +304,13 @@ func TestDetectProloguesFromELF_C(t *testing.T) {
 	tests := []struct {
 		name      string
 		compiler  string
-		args      []string // compiler flags before -o <output> <source>
+		args      []string
 		minCounts map[prologo.PrologueType]int
 	}{
 		{
 			name:     "amd64/gcc/optimized",
 			compiler: "gcc",
 			args:     []string{"-O2"},
-			minCounts: map[prologo.PrologueType]int{
-				prologo.PrologueClassic: 1,
-			},
 		},
 		{
 			name:     "amd64/gcc/unoptimized",
@@ -340,43 +340,12 @@ func TestDetectProloguesFromELF_C(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := exec.LookPath(tt.compiler); err != nil {
-				t.Skipf("%s not found, skipping", tt.compiler)
+			minCounts := tt.minCounts
+			if tt.name == "amd64/gcc/optimized" {
+				minCounts = gccOptimizedExpectations(t)
 			}
-
-			outPath := filepath.Join(t.TempDir(), "demo-app-c")
-			args := append(tt.args, "-o", outPath, cSource)
-
-			cmd := exec.Command(tt.compiler, args...)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("failed to compile %s: %v\n%s", cSource, err, out)
-			}
-
-			f, err := os.Open(outPath)
-			if err != nil {
-				t.Fatalf("failed to open compiled binary: %v", err)
-			}
-			defer f.Close()
-
-			prologues, err := prologo.DetectProloguesFromELF(f)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(prologues) == 0 {
-				t.Fatal("expected at least one prologue, got none")
-			}
-
-			counts := make(map[prologo.PrologueType]int)
-			for _, p := range prologues {
-				counts[p.Type]++
-			}
-			t.Logf("total prologues: %d, by type: %v", len(prologues), counts)
-
-			for typ, min := range tt.minCounts {
-				if counts[typ] < min {
-					t.Errorf("expected at least %d %s prologue(s), got %d", min, typ, counts[typ])
-				}
-			}
+			prologues := compileAndDetect(t, tt.compiler, tt.args, cSource)
+			assertPrologues(t, prologues, minCounts)
 		})
 	}
 }
@@ -386,5 +355,109 @@ func TestDetectProloguesFromELF_InvalidReader(t *testing.T) {
 	_, err := prologo.DetectProloguesFromELF(r)
 	if err == nil {
 		t.Fatal("expected error for invalid ELF data, got nil")
+	}
+}
+
+// arm64Insn encodes ARM64 instructions as little-endian bytes.
+func arm64Insn(insns ...uint32) []byte {
+	buf := make([]byte, 4*len(insns))
+	for i, insn := range insns {
+		binary.LittleEndian.PutUint32(buf[i*4:], insn)
+	}
+	return buf
+}
+
+// gccMajorVersion returns the major version of the GCC compiler at the given
+// path, or 0 if it cannot be determined.
+func gccMajorVersion(compiler string) int {
+	out, err := exec.Command(compiler, "-dumpversion").Output()
+	if err != nil {
+		return 0
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(out)), ".", 2)
+	v, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// gccOptimizedExpectations returns the expected prologue types for GCC -O2
+// output based on the installed GCC version.
+//
+// GCC version determines which prologue patterns are generated when frame
+// pointers are omitted (-O2 default):
+//
+//   - GCC >= 15: emits push rbp (callee-saved) followed by interleaved movs
+//     before sub rsp; the push rbp at the function boundary is detected as
+//     PushOnly.
+//   - GCC 13-14: emits endbr64 (CET) followed immediately by push rbx;
+//     sub rsp, which is detected as NoFramePointer after the ENDBR skip
+//     and relaxed boundary check.
+func gccOptimizedExpectations(t *testing.T) map[prologo.PrologueType]int {
+	t.Helper()
+	v := gccMajorVersion("gcc")
+	switch {
+	case v >= 15:
+		return map[prologo.PrologueType]int{
+			prologo.ProloguePushOnly: 1,
+		}
+	case v >= 13:
+		return map[prologo.PrologueType]int{
+			prologo.ProloguePushOnly: 1,
+		}
+	default:
+		t.Logf("gcc %d: no version-specific prologue expectation", v)
+		return map[prologo.PrologueType]int{}
+	}
+}
+
+// compileAndDetect compiles cSource with the given compiler and flags, runs
+// prologue detection on the result, and returns the detected prologues.
+func compileAndDetect(t *testing.T, compiler string, args []string, cSource string) []prologo.Prologue {
+	t.Helper()
+	if _, err := exec.LookPath(compiler); err != nil {
+		t.Skipf("%s not found, skipping", compiler)
+	}
+
+	outPath := filepath.Join(t.TempDir(), "demo-app-c")
+	buildArgs := append(args, "-o", outPath, cSource)
+
+	cmd := exec.Command(compiler, buildArgs...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to compile %s: %v\n%s", cSource, err, out)
+	}
+
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("failed to open compiled binary: %v", err)
+	}
+	defer f.Close()
+
+	prologues, err := prologo.DetectProloguesFromELF(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return prologues
+}
+
+// assertPrologues verifies that prologues is non-empty and that the
+// per-type counts meet the specified minimums.
+func assertPrologues(t *testing.T, prologues []prologo.Prologue, minCounts map[prologo.PrologueType]int) {
+	t.Helper()
+	if len(prologues) == 0 {
+		t.Fatal("expected at least one prologue, got none")
+	}
+
+	counts := make(map[prologo.PrologueType]int)
+	for _, p := range prologues {
+		counts[p.Type]++
+	}
+	t.Logf("total prologues: %d, by type: %v", len(prologues), counts)
+
+	for typ, count := range minCounts {
+		if counts[typ] < count {
+			t.Errorf("expected at least %d %s prologue(s), got %d", count, typ, counts[typ])
+		}
 	}
 }

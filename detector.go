@@ -32,6 +32,18 @@ func detectProloguesAMD64(code []byte, baseAddr uint64) ([]Prologue, error) {
 	var prevInsn *x86asm.Inst
 
 	for offset < len(code) {
+		// Skip ENDBR64 (f3 0f 1e fa) and ENDBR32 (f3 0f 1e fb) which
+		// golang.org/x/arch/x86/x86asm does not recognise. These CET
+		// instructions appear at function entries on binaries compiled
+		// with -fcf-protection and are transparent to prologue detection.
+		if offset+4 <= len(code) &&
+			code[offset] == 0xf3 && code[offset+1] == 0x0f &&
+			code[offset+2] == 0x1e && (code[offset+3] == 0xfa || code[offset+3] == 0xfb) {
+			offset += 4
+			addr += 4
+			continue // prevInsn intentionally unchanged
+		}
+
 		inst, err := x86asm.Decode(code[offset:], 64)
 		if err != nil {
 			offset++
@@ -54,24 +66,26 @@ func detectProloguesAMD64(code []byte, baseAddr uint64) ([]Prologue, error) {
 		// Pattern 2: No-frame-pointer function - sub rsp, imm
 		if inst.Op == x86asm.SUB && inst.Args[0] == x86asm.RSP {
 			if imm, ok := inst.Args[1].(x86asm.Imm); ok && imm > 0 {
-				if prevInsn == nil || prevInsn.Op == x86asm.RET {
+				if prevInsn == nil || prevInsn.Op == x86asm.RET || prevInsn.Op == x86asm.PUSH {
 					result = append(result, Prologue{
 						Address:      addr,
 						Type:         PrologueNoFramePointer,
-						Instructions: fmt.Sprintf("sub rsp, 0x%x", imm),
+						Instructions: fmt.Sprintf("sub rsp, 0x%x", int64(imm)),
 					})
 				}
 			}
 		}
 
-		// Pattern 3: Push rbp as first instruction
-		if inst.Op == x86asm.PUSH && inst.Args[0] == x86asm.RBP {
-			if prevInsn == nil || prevInsn.Op == x86asm.RET {
-				result = append(result, Prologue{
-					Address:      addr,
-					Type:         ProloguePushOnly,
-					Instructions: "push rbp",
-				})
+		// Pattern 3: Push callee-saved register at function boundary
+		if inst.Op == x86asm.PUSH {
+			if reg, ok := inst.Args[0].(x86asm.Reg); ok && isCalleeSavedAMD64(reg) {
+				if prevInsn == nil || prevInsn.Op == x86asm.RET {
+					result = append(result, Prologue{
+						Address:      addr,
+						Type:         ProloguePushOnly,
+						Instructions: fmt.Sprintf("push %s", reg),
+					})
+				}
 			}
 		}
 
@@ -92,6 +106,14 @@ func detectProloguesAMD64(code []byte, baseAddr uint64) ([]Prologue, error) {
 	}
 
 	return result, nil
+}
+
+func isCalleeSavedAMD64(reg x86asm.Reg) bool {
+	switch reg {
+	case x86asm.RBX, x86asm.RBP, x86asm.R12, x86asm.R13, x86asm.R14, x86asm.R15:
+		return true
+	}
+	return false
 }
 
 // isSTPx29x30PreIndex checks if an ARM64 instruction is stp x29, x30, [sp, #-N]!
